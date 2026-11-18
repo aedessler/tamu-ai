@@ -10,15 +10,17 @@ Use as a module (sys.path does not expand "~", hence expanduser):
 
     import os, sys
     sys.path.insert(0, os.path.expanduser("~/.claude/skills/tamu-ai/scripts"))
-    from tamu_ai import chat, list_models, run_batch, extract_json
+    from tamu_ai import chat, list_models, run_batch, extract_json, generate_image
 
     print(chat([{"role": "user", "content": "hi"}], model="protected.gpt-5.4-mini"))
 
 Or as a CLI:
 
     python3 tamu_ai.py --check
+    python3 tamu_ai.py --check-all
     python3 tamu_ai.py --list-models
     python3 tamu_ai.py --chat "explain lapse rate in one sentence"
+    python3 tamu_ai.py --image "a red circle" -o circle.png
 
 The API key is NEVER stored in this file. It is resolved from, in order:
   1. $TAMU_AI_API_KEY
@@ -28,6 +30,7 @@ The API key is NEVER stored in this file. It is resolved from, in order:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -44,9 +47,10 @@ BASE_URL = "https://chat-api.tamu.ai/openai"
 KEY_FILE = Path.home() / ".config" / "tamu-ai" / "api-key"
 
 # No default model on purpose: pick per task. See ../references/models.md.
-# These two are the well-characterized endpoints of the speed/judgment tradeoff.
-FAST_MODEL = "protected.gpt-5.4-mini"     # ~1.0 s/call, all standard params work
-JUDGMENT_MODEL = "protected.Claude Sonnet 4.6"  # ~2.5 s/call, strong rubric adherence
+# These are well-characterized points on the speed/judgment tradeoff.
+FAST_MODEL = "protected.gpt-5.4-mini"         # ~1.0 s/call, all standard params work
+JUDGMENT_MODEL = "protected.Claude-Sonnet-5"  # ~1.5-2 s/call, all standard params work
+IMAGE_MODEL = "protected.gemini-3.1-flash-image"  # ~10 s/image, PNG
 
 DEFAULT_TIMEOUT = 180
 DEFAULT_WORKERS = 8
@@ -91,47 +95,114 @@ def _headers(api_key=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Model-family parameter guards
+# Per-model parameter guards
+#
+# These sets are what the live gateway did on 2026-11-17, model by model -- NOT
+# a family rule. "Claude" does not imply thinking: Opus 4.7/4.8, Opus 5,
+# Sonnet 5 and Haiku 4.5 accept every sampling parameter. Unknown models get no
+# guarding; the gateway now returns a clear HTTP 400 for a rejected parameter.
 # ---------------------------------------------------------------------------
 
-def is_thinking_model(model: str) -> bool:
-    """Claude models on this gateway run with extended thinking always enabled."""
-    m = model.lower()
-    return "claude" in m or "haiku" in m or "opus" in m or "sonnet" in m
+# Bedrock runs these with extended thinking permanently enabled.
+THINKING_LOCKED_MODELS = frozenset({
+    "protected.Claude Opus 4.1",
+    "protected.Claude Opus 4.5",
+    "protected.Claude Opus 4.6",
+    "protected.Claude Sonnet 4.5",
+    "protected.Claude Sonnet 4.6",
+})
 
+# Azure reasoning deployments: temperature is fixed at 1, top_p is unsupported.
+FIXED_SAMPLING_MODELS = frozenset({
+    "protected.gpt-5.5",
+    "protected.gpt-5.6-luna",
+    "protected.gpt-5.6-sol",
+    "protected.gpt-5.6-terra",
+})
 
-# Params that Bedrock rejects outright when thinking is on. Dropping them with a
-# warning beats surfacing an opaque BedrockException from three layers down.
+# Adaptive thinking: the model decides how long to think, and that thinking
+# counts against the output budget. The gateway's implicit budget is 4096
+# tokens, which a hard prompt can spend entirely on thinking -- the reply is
+# then HTTP 200 with EMPTY content and finish_reason "length". When the caller
+# sets no budget and no thinking control, the client sends a larger one.
+ADAPTIVE_THINKING_MODELS = frozenset({
+    "protected.Claude-Opus-5",
+    "protected.Claude-Sonnet-5",
+})
+ADAPTIVE_DEFAULT_MAX_TOKENS = 16000
+_THINKING_CONTROLS = ("max_tokens", "max_completion_tokens", "reasoning_effort", "thinking")
+
+# Each of temperature / top_p works alone; Bedrock rejects the pair together.
+ONE_SAMPLER_MODELS = frozenset({
+    "protected.Claude-Haiku-4.5",
+})
+
 _THINKING_BANNED = {
     "temperature": "may only be 1 when thinking is enabled",
     "top_p": "must be >= 0.95 or unset",
     "max_tokens": "must exceed the thinking budget",
     "max_completion_tokens": "must exceed the thinking budget",
 }
+_FIXED_SAMPLING_BANNED = {
+    "temperature": "only the default (1) is supported",
+    "top_p": "not supported by this model",
+}
+
+
+def is_thinking_model(model: str) -> bool:
+    """True for models that run with extended thinking always enabled."""
+    return model in THINKING_LOCKED_MODELS
+
+
+def is_claude_model(model: str) -> bool:
+    return "claude" in model.lower()
+
+
+def is_image_model(model: str) -> bool:
+    """Image-generation models. They answer chat calls with a markdown image."""
+    return "image" in model.lower()
 
 
 def _guard_params(model: str, params: dict, quiet: bool = False) -> dict:
-    """Strip params a thinking model rejects; raise on ones that fail silently."""
-    if not is_thinking_model(model):
-        return params
-
-    # response_format is the dangerous one: the gateway ACCEPTS it and then
-    # returns an empty {} instead of erroring. Silently dropping it would leave
-    # the caller believing they have guaranteed JSON. Refuse loudly instead.
-    if "response_format" in params:
+    """Strip params a model rejects; raise on ones that are silently ignored."""
+    # response_format is accepted by every Claude model and then NOT enforced:
+    # replies come back as ```json-fenced markdown (in July 2026 Sonnet 4.6
+    # returned a bare "{}"). Dropping it quietly would leave the caller
+    # believing they have guaranteed JSON. Refuse loudly instead.
+    if is_claude_model(model) and "response_format" in params:
         raise TamuAIError(
-            f"response_format is silently broken on {model}: the gateway accepts "
-            "it and returns an empty {} instead of your content.\n"
+            f"response_format is not enforced on {model}: the gateway accepts "
+            "it and the model still replies in free-form (often ```json-fenced) "
+            "text.\n"
             "  Fix: ask for JSON in the prompt text instead, and parse the reply "
-            "with extract_json() (it tolerates ```json fences, which Claude adds).\n"
+            "with extract_json() (it tolerates ```json fences).\n"
             f"  Or use a GPT model ({FAST_MODEL}), where response_format works."
         )
 
+    if model in ADAPTIVE_THINKING_MODELS and not any(k in params for k in _THINKING_CONTROLS):
+        return {**params, "max_tokens": ADAPTIVE_DEFAULT_MAX_TOKENS}
+
+    if model in ONE_SAMPLER_MODELS and "temperature" in params and "top_p" in params:
+        if not quiet:
+            print(f"  [tamu_ai] dropped 'top_p' for {model} (temperature and "
+                  "top_p cannot both be set; keeping temperature)", file=sys.stderr)
+        return {k: v for k, v in params.items() if k != "top_p"}
+
+    if model in THINKING_LOCKED_MODELS:
+        banned = _THINKING_BANNED
+    elif model in FIXED_SAMPLING_MODELS:
+        banned = _FIXED_SAMPLING_BANNED
+    else:
+        return params
+
     cleaned = dict(params)
-    for name, why in _THINKING_BANNED.items():
+    for name, why in banned.items():
         if name in cleaned:
             if name == "temperature" and cleaned[name] == 1:
                 continue  # temperature=1 is the one allowed value
+            if (banned is _THINKING_BANNED and name == "top_p"
+                    and isinstance(cleaned[name], (int, float)) and cleaned[name] >= 0.95):
+                continue  # thinking models accept top_p >= 0.95
             cleaned.pop(name)
             if not quiet:
                 print(f"  [tamu_ai] dropped {name!r} for {model} ({why})",
@@ -140,24 +211,38 @@ def _guard_params(model: str, params: dict, quiet: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Response checking -- three distinct failure shapes
+# Response checking -- four distinct failure shapes
 # ---------------------------------------------------------------------------
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_ERROR_CODE_RE = re.compile(r"Error Code:\s*(\d{3})")
+# Gateway-authored messages: "🚫 **Rate Limit Reached**\n\n..."
+_GATEWAY_BANNER_RE = re.compile(r"^\s*\U0001F6AB\s*\*\*(.+?)\*\*\s*", re.DOTALL)
+
+
+def _clean_gateway_text(text: str) -> str:
+    """'🚫 **Error**\\n\\nlitellm...' -> 'Error: litellm...' on one line."""
+    text = _GATEWAY_BANNER_RE.sub(lambda m: m.group(1) + ": ", str(text), count=1)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def _check_response(resp) -> dict:
     """Validate a gateway response and return its parsed body.
 
-    The gateway fails in three different ways and only one looks like an error
-    to normal code:
-      1. HTTP 200 with {"error": {...}}   <- upstream/LiteLLM errors
-      2. HTTP 4xx with {"detail": "..."}  <- gateway rejections
-      3. transport timeouts               <- handled by the caller's retry loop
+    The gateway fails in several ways and only some look like errors:
+      1. HTTP 4xx/5xx with {"detail": "..."}  <- the usual shape (2026-11)
+      2. HTTP 200 with {"error": {...}}        <- upstream errors (2026-07)
+      3. HTTP 200 whose reply TEXT is a gateway error, e.g.
+         "🚫 **Empty Response**"                 <- caught in chat()
+      4. transport timeouts                     <- handled by the retry loop
+      5. HTTP 200 with an empty reply            <- caught in chat()
     """
     try:
         payload = resp.json() if resp.content else {}
     except ValueError:
         payload = {}
 
-    if isinstance(payload, dict) and "error" in payload:
+    if isinstance(payload, dict) and payload.get("error"):
         err = payload["error"]
         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         # Upstream 429/5xx surfaced inside a 200 body is still worth retrying.
@@ -165,13 +250,32 @@ def _check_response(resp) -> dict:
                                                    "overloaded", "503", "502"))
         raise TamuAIError(f"gateway error: {msg}", retryable=retryable)
 
-    if isinstance(payload, dict) and "detail" in payload:
-        raise TamuAIError(f"gateway rejected request: {payload['detail']}",
-                          retryable=False)
+    if isinstance(payload, dict) and payload.get("detail"):
+        detail = str(payload["detail"])
+        match = _ERROR_CODE_RE.search(detail)
+        code = int(match.group(1)) if match else resp.status_code
+        msg = _clean_gateway_text(detail)
+        if "no 'choices'" in detail:
+            # Reasoning models (e.g. gemini-3.5-flash) spend max_tokens on
+            # thinking and then have nothing left to answer with. Deterministic.
+            raise TamuAIError(
+                f"gateway rejected request (HTTP {code}): {msg[:300]}\n"
+                "  Likely cause: max_tokens too small for a reasoning model -- "
+                "raise it or leave it unset.", retryable=False)
+        if code == 524:
+            # Cloudflare in front of the gateway cuts any request at 120 s.
+            # Retrying the same request just hits the same wall.
+            raise TamuAIError(
+                f"gateway timed out (HTTP 524): {msg[:200]}\n"
+                "  The gateway proxy cuts requests off at 120 s. Shorten the input "
+                "or output, or limit thinking (reasoning_effort=\"low\").",
+                retryable=False)
+        raise TamuAIError(f"gateway rejected request (HTTP {code}): {msg[:500]}",
+                          retryable=code in _RETRYABLE_STATUS)
 
     if resp.status_code >= 400:
         raise TamuAIError(f"HTTP {resp.status_code}: {resp.text[:300]}",
-                          retryable=resp.status_code >= 500 or resp.status_code == 429)
+                          retryable=resp.status_code in _RETRYABLE_STATUS)
 
     return payload
 
@@ -189,9 +293,12 @@ def list_models(api_key=None, timeout=30) -> list[str]:
 
 def chat_raw(messages, model, api_key=None, session=None, retries=4,
              timeout=DEFAULT_TIMEOUT, quiet=False, **params) -> dict:
-    """One chat completion; returns the full response JSON (including `usage`)."""
-    body = {"model": model, "messages": messages, "stream": False,
-            **_guard_params(model, params, quiet)}
+    """One chat completion; returns the full response JSON (including `usage`).
+
+    Always sends stream=False: the gateway streams SSE when `stream` is omitted.
+    """
+    body = {"model": model, "messages": messages,
+            **_guard_params(model, params, quiet), "stream": False}
     headers = _headers(api_key)
     poster = (session or requests).post
 
@@ -216,32 +323,109 @@ def chat(messages, model, **kwargs) -> str:
     """One chat completion; returns just the reply text.
 
     `messages` may also be a plain string, treated as a single user turn.
+    For image models the text is a markdown image with a base64 data URI;
+    use generate_image() / extract_images() to get the bytes.
     """
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
     payload = chat_raw(messages, model, **kwargs)
     try:
-        return payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
         raise TamuAIError(f"unexpected response shape: {str(payload)[:300]}") from exc
+    if not (content or "").strip():
+        # Failure shape 5: HTTP 200, empty reply. Seen when a thinking model
+        # spends the whole output budget thinking. Never return "" as an answer.
+        hint = ""
+        if choice.get("finish_reason") == "length":
+            hint = ("\n  The output budget ran out before any reply text (thinking "
+                    "counts against it). Raise max_tokens, or pass "
+                    "reasoning_effort=\"low\" to think less.")
+        raise TamuAIError(f"{model} returned an empty reply "
+                          f"(finish_reason={choice.get('finish_reason')!r}).{hint}")
+    # Failure shape 3: an HTTP 200 whose reply text is a gateway error banner,
+    # e.g. an image model given a prompt it can't draw.
+    if _GATEWAY_BANNER_RE.match(content):
+        raise TamuAIError(f"gateway error in reply from {model}: "
+                          f"{_clean_gateway_text(content)[:300]}")
+    return content
 
 
-def extract_json(text: str) -> dict:
-    """Parse JSON out of a model reply.
+def extract_json(text: str):
+    """Parse the first JSON object or array out of a model reply.
 
-    Claude models on this gateway wrap JSON in ```json fences; GPT models don't.
-    This tolerates both, plus stray prose around the object.
+    Claude models sometimes wrap JSON in ```json fences and sometimes don't --
+    the same prompt produced both. This tolerates fences, prose before or after
+    the value, and stray braces in that prose.
     """
     text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text,
+                       flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    match = re.search(r"[\{\[].*[\}\]]", text, flags=re.DOTALL)
-    if not match:
-        raise TamuAIError(f"no JSON found in reply: {text[:200]!r}")
-    return json.loads(match.group(0))
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\{\[]", text):
+        try:
+            value, _ = decoder.raw_decode(text, match.start())
+            return value
+        except json.JSONDecodeError:
+            continue
+    raise TamuAIError(f"no JSON found in reply: {text[:200]!r}")
+
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+
+_DATA_URI_RE = re.compile(r"data:image/([\w.+-]+);base64,([A-Za-z0-9+/=]+)")
+_MAGIC = [(b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpeg"),
+          (b"GIF8", "gif"), (b"RIFF", "webp")]
+
+
+def _sniff_image(data: bytes, declared: str) -> str:
+    # gemini-3.1-flash-lite-image labels JPEG bytes as image/png; trust the bytes.
+    for magic, fmt in _MAGIC:
+        if data.startswith(magic):
+            return fmt
+    return declared.lower()
+
+
+def extract_images(text: str) -> list[tuple[str, bytes]]:
+    """Every base64 image in a reply, as (format, bytes). Format is sniffed."""
+    images = []
+    for declared, b64 in _DATA_URI_RE.findall(text or ""):
+        data = base64.b64decode(b64)
+        images.append((_sniff_image(data, declared), data))
+    return images
+
+
+def generate_image(prompt, model=IMAGE_MODEL, out_path=None, **kwargs):
+    """Generate one image through /chat/completions.
+
+    Returns (format, bytes, written_path). /images/generations is blocked (403),
+    so image models are reached through chat. If out_path is given the image is
+    written there -- with the suffix corrected when it disagrees with the real
+    format -- and written_path says where; otherwise written_path is None.
+    """
+    reply = chat(prompt, model, **kwargs)
+    images = extract_images(reply)
+    if not images:
+        raise TamuAIError(f"{model} returned no image: {reply[:200]!r}")
+    fmt, data = images[0]
+    if out_path is None:
+        return fmt, data, None
+    out = Path(out_path)
+    ext = ".jpg" if fmt == "jpeg" else f".{fmt}"
+    if out.suffix.lower() not in ({".jpg", ".jpeg"} if fmt == "jpeg" else {ext}):
+        out = out.with_suffix(ext)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    return fmt, data, out
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +481,8 @@ def run_batch(items, build_messages, model, workers=DEFAULT_WORKERS,
     parse          : optional reply -> value transform, e.g. extract_json
     cache_path     : JSON file; results are keyed by (prompt_version, model,
                      messages), so a re-run costs nothing for finished items and
-                     editing a prompt invalidates only what actually changed
+                     editing a prompt invalidates only what actually changed.
+                     Finished work is saved even if the run is interrupted.
     returns        : (results, failures) where results is a list aligned with
                      `items` (None where the call failed) and failures is a list
                      of (index, item, error_string)
@@ -312,6 +497,7 @@ def run_batch(items, build_messages, model, workers=DEFAULT_WORKERS,
     lock = threading.Lock()
     session = requests.Session()
     key = api_key or resolve_key()
+    _guard_params(model, params, quiet)  # fail fast, and warn once not per item
     t0 = time.time()
 
     def work(idx_item):
@@ -334,7 +520,8 @@ def run_batch(items, build_messages, model, workers=DEFAULT_WORKERS,
         except Exception as exc:  # noqa: BLE001 - collected, not raised
             return idx, item, None, f"{type(exc).__name__}: {exc}"
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = [pool.submit(work, pair) for pair in enumerate(items)]
         for fut in as_completed(futures):
             idx, item, value, err = fut.result()
@@ -350,7 +537,11 @@ def run_batch(items, build_messages, model, workers=DEFAULT_WORKERS,
                           f"{len(failures)} failed)", flush=True)
                 if done % 50 == 0:
                     cache.save()
-    cache.save()
+    finally:
+        # On Ctrl-C: drop queued calls instead of waiting for them, and keep
+        # everything that already finished so a re-run picks up from here.
+        pool.shutdown(wait=False, cancel_futures=True)
+        cache.save()
     return results, failures
 
 
@@ -358,32 +549,73 @@ def run_batch(items, build_messages, model, workers=DEFAULT_WORKERS,
 # CLI
 # ---------------------------------------------------------------------------
 
+def check_all(workers=DEFAULT_WORKERS) -> int:
+    """One round-trip per listed text model. Returns the number that failed."""
+    models = [m for m in list_models()
+              if not is_image_model(m) and "embedding" not in m.lower()]
+    session = requests.Session()
+    key = resolve_key()
+
+    def probe(model):
+        t0 = time.time()
+        try:
+            reply = chat("Reply with exactly: ok", model, api_key=key,
+                         session=session, retries=1, timeout=60, quiet=True)
+            return model, True, f"{time.time() - t0:4.1f}s  {reply.strip()[:40]!r}"
+        except Exception as exc:  # noqa: BLE001
+            return model, False, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        rows = sorted(pool.map(probe, models))
+    width = max(len(m) for m in models)
+    for model, ok, note in rows:
+        print(f"{'OK  ' if ok else 'FAIL'} {model:<{width}}  {note}")
+    failed = sum(not ok for _, ok, _ in rows)
+    print(f"\n{len(rows) - failed}/{len(rows)} text models answered. "
+          "Image and embedding models were skipped.")
+    return failed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="TAMU AI client", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list-models", action="store_true")
     ap.add_argument("--chat", metavar="TEXT", help="send one message")
+    ap.add_argument("--image", metavar="PROMPT", help="generate one image")
+    ap.add_argument("-o", "--out", default="image.png",
+                    help="output path for --image (suffix fixed to real format)")
     ap.add_argument("--check", action="store_true",
                     help="verify the key, list models, and do one round-trip")
-    ap.add_argument("-m", "--model", default=FAST_MODEL)
+    ap.add_argument("--check-all", action="store_true",
+                    help="round-trip every listed text model and report which work")
+    ap.add_argument("-m", "--model", default=None,
+                    help=f"model id (default: {FAST_MODEL}; {IMAGE_MODEL} for --image)")
     ap.add_argument("--system", help="optional system prompt")
     args = ap.parse_args()
 
     try:
         if args.check:
+            model = args.model or FAST_MODEL
             models = list_models()
             print(f"Key OK. {len(models)} models available.")
-            print(f"Round-trip on {args.model}:")
-            print("  " + chat("Reply with exactly: ok", args.model).strip()[:200])
+            print(f"Round-trip on {model}:")
+            print("  " + chat("Reply with exactly: ok", model).strip()[:200])
             return 0
+        if args.check_all:
+            return 1 if check_all() else 0
         if args.list_models:
             for m in list_models():
                 print(m)
             return 0
+        if args.image:
+            _, data, path = generate_image(args.image, args.model or IMAGE_MODEL,
+                                           out_path=args.out)
+            print(f"Wrote {path} ({len(data):,} bytes)")
+            return 0
         if args.chat:
             msgs = ([{"role": "system", "content": args.system}] if args.system else [])
             msgs.append({"role": "user", "content": args.chat})
-            print(chat(msgs, args.model))
+            print(chat(msgs, args.model or FAST_MODEL))
             return 0
         ap.print_help()
         return 0
