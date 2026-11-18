@@ -214,7 +214,7 @@ Two properties that matter on long runs:
 
 ~2.7–3.4 requests/sec at 8–10 workers. A general rate limit was not hit at 15
 concurrent requests, but the gateway does return 429 *"Rate Limit Reached"* (seen
-on `Claude Sonnet 4`), and the client retries it. Start at 8.
+occasionally), and the client retries it. Start at 8.
 
 **Shape of a real job this was built from:** grading 457 short answers from a
 Canvas quiz export — one call per answer carrying that question's rubric, run at

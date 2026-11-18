@@ -36,7 +36,6 @@ protected.Claude Opus 4.1      thinking
 protected.Claude Sonnet 4.6    thinking
 protected.Claude Sonnet 4.5    thinking
 protected.Claude-Haiku-4.5     temperature OR top_p, not both
-protected.Claude Sonnet 4      LISTED BUT UNUSABLE — 404 NotFound / 429 on every call
 ```
 
 `protected.Claude 3.5 Haiku` was removed from the roster after 2026-07.

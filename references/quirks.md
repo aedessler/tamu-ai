@@ -21,7 +21,7 @@ layering: errors from different tiers reach you in different formats.
 | Upstream errors | HTTP 200 + `{"error": {...}}` | HTTP 4xx/5xx + `{"detail": "🚫 **...**"}` |
 | `response_format` on Claude Sonnet 4.6 | 200, content `{}` | 200, real content (often ` ```json `-fenced) — accepted but not enforced |
 | Claude models with thinking always on | assumed all | only Opus 4.1/4.5/4.6, Sonnet 4.5/4.6 |
-| Rate limiting | none seen | 429 seen (on `Claude Sonnet 4`), none at 15 concurrent elsewhere |
+| Rate limiting | none seen | 429 seen occasionally, none at 15 concurrent |
 | `stream` omitted | not tested | gateway streams SSE |
 | Image models | none | 5 models, reached through chat |
 | Empty replies | not seen | `Claude-Sonnet-5` / `Claude-Opus-5` can spend the whole output budget thinking |
@@ -94,7 +94,7 @@ POST /chat/completions  {"model":"protected.gpt-5.6-sol", ..., "temperature":0}
     Only the default (1) value is supported.. Received Model Group=gpt-5.6-sol\n
     Available Model Group Fallbacks=None\n\n*Error Code: 400*"}
 
-POST /chat/completions  {"model":"protected.Claude Sonnet 4", ...}
+POST /chat/completions  {"model":"protected.<model>", ...}
 → HTTP 429
   {"detail":"🚫 **Rate Limit Reached**\n\nYou are sending requests faster than your account
     allows. Please wait a moment and try again.\n\n*Error Code: 429*"}
@@ -331,6 +331,5 @@ From the 457-call quiz-grading run (2026-07):
 | Rate limiting observed | none at 10 concurrent |
 
 2026-11: 30 calls at 15 concurrent to `gpt-4.1-nano` all succeeded; a 36-model
-sweep at 8 concurrent saw a 429 only from `Claude Sonnet 4`, which is otherwise
-unusable (404 NotFound). 8 workers is a safe starting point. No documented quota
+sweep at 8 concurrent saw an occasional 429. 8 workers is a safe starting point. No documented quota
 was discoverable, so don't assume unlimited — cache results so a re-run is free.
